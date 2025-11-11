@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import unescape
 from typing import Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urlunparse, parse_qsl
@@ -37,6 +38,9 @@ class ValidatorAgent:
         """
         self.api_key = api_key or os.environ.get("GOOGLE_API_KEY")
         self._client = None
+        # Create a session with connection pooling for better performance
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": DEFAULT_USER_AGENT})
 
     @property
     def client(self):
@@ -76,10 +80,8 @@ class ValidatorAgent:
         valid_urls = self._filter_and_validate_urls(uris, company_url, set(competitors))
         valid_urls = valid_urls[:max_results]
 
-        results = []
-        for url in valid_urls:
-            meta = self._make_meta_title(url, language)
-            results.append({"url": url, "url_meta_title": meta})
+        # Fetch titles concurrently for better performance
+        results = self._fetch_titles_concurrent(valid_urls, language)
         return results
 
     def _call_gemini_with_search(self, user_query: str):
@@ -142,14 +144,12 @@ class ValidatorAgent:
     def _unwrap_redirect(self, url: str, timeout: float = 8.0) -> str:
         """Follow redirects to reveal final destination."""
         try:
-            with requests.Session() as s:
-                s.headers.update({"User-Agent": DEFAULT_USER_AGENT})
-                resp = s.head(url, allow_redirects=True, timeout=timeout)
-                if resp.ok:
-                    return resp.url
-                resp = s.get(url, allow_redirects=True, timeout=timeout)
-                if resp.ok:
-                    return resp.url
+            resp = self._session.head(url, allow_redirects=True, timeout=timeout)
+            if resp.ok:
+                return resp.url
+            resp = self._session.get(url, allow_redirects=True, timeout=timeout)
+            if resp.ok:
+                return resp.url
         except requests.RequestException:
             pass
         return url
@@ -157,13 +157,11 @@ class ValidatorAgent:
     def _check_url_ok(self, url: str, timeout: float = 8.0) -> bool:
         """Check if URL returns HTTP 200."""
         try:
-            with requests.Session() as s:
-                s.headers.update({"User-Agent": DEFAULT_USER_AGENT})
-                r = s.head(url, allow_redirects=True, timeout=timeout)
-                if r.status_code == 200:
-                    return True
-                r = s.get(url, allow_redirects=True, timeout=timeout)
-                return r.status_code == 200
+            r = self._session.head(url, allow_redirects=True, timeout=timeout)
+            if r.status_code == 200:
+                return True
+            r = self._session.get(url, allow_redirects=True, timeout=timeout)
+            return r.status_code == 200
         except requests.RequestException:
             return False
 
@@ -229,17 +227,66 @@ class ValidatorAgent:
     def _fetch_page_title(self, url: str, timeout: float = 8.0) -> Optional[str]:
         """Fetch page title from URL."""
         try:
-            with requests.Session() as s:
-                s.headers.update({"User-Agent": DEFAULT_USER_AGENT})
-                r = s.get(url, timeout=timeout)
-                if r.status_code != 200 or "text/html" not in (r.headers.get("Content-Type", "")):
-                    return None
-                return self._extract_html_title(r.text)
+            r = self._session.get(url, timeout=timeout)
+            if r.status_code != 200 or "text/html" not in (r.headers.get("Content-Type", "")):
+                return None
+            return self._extract_html_title(r.text)
         except requests.RequestException:
             return None
 
+    def _fetch_titles_concurrent(self, urls: List[str], language: str) -> List[dict]:
+        """
+        Fetch titles for multiple URLs concurrently.
+        
+        Args:
+            urls: List of URLs to fetch titles for
+            language: Language code for fallback titles
+            
+        Returns:
+            List of dicts with 'url' and 'url_meta_title' keys
+        """
+        results = []
+        
+        if not urls:
+            return results
+        
+        # Fetch titles concurrently
+        with ThreadPoolExecutor(max_workers=min(10, len(urls))) as executor:
+            future_to_url = {
+                executor.submit(self._fetch_page_title, url): url
+                for url in urls
+            }
+            
+            url_to_title = {}
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    title = future.result()
+                    url_to_title[url] = title
+                except Exception:
+                    url_to_title[url] = None
+        
+        # Build results with titles or fallbacks
+        for url in urls:
+            title = url_to_title.get(url)
+            if title:
+                meta_title = title if len(title) <= 140 else title[:137] + "..."
+            else:
+                host = self._normalize_hostname(url)
+                lang_map = {
+                    "de": f"Quelle: {host}",
+                    "fr": f"Source : {host}",
+                    "pt": f"Fonte: {host}",
+                    "es": f"Fuente: {host}",
+                }
+                meta_title = lang_map.get(language.lower()[:2], f"Source: {host}")
+            
+            results.append({"url": url, "url_meta_title": meta_title})
+        
+        return results
+
     def _make_meta_title(self, url: str, language: str) -> str:
-        """Generate meta title for URL."""
+        """Generate meta title for URL (legacy method, use _fetch_titles_concurrent for batch)."""
         title = self._fetch_page_title(url)
         if title:
             return title if len(title) <= 140 else title[:137] + "..."

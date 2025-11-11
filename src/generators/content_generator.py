@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 from google import genai
@@ -28,10 +29,16 @@ class ContentGenerator:
             config: Configuration object (optional)
             api_key: Google AI API key (optional, uses config if not provided)
         """
+        import requests
         self.config = config or Config()
         self.api_key = api_key or self.config.get_api_key()
         self.validator_agent = ValidatorAgent(api_key=self.api_key)
         self._client = None
+        # Create HTTP session with connection pooling for better performance
+        self._http_session = requests.Session()
+        self._http_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        })
 
     @property
     def client(self):
@@ -360,52 +367,11 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
         if not parsed_sources:
             return []
 
-        # Validate each URL individually
-        validated_sources = []
-        invalid_count = 0
-        
-        for source in parsed_sources[:20]:  # Limit to 20 sources
-            url = source["url"]
-            
-            # Validate URL: check HTTP status, filter competitors/company domains
-            is_valid, validated_url, validated_title = self._validate_source_url(
-                url=url,
-                original_title=source["title"],
-                company_url=input_data.company_url,
-                competitors=input_data.company_competitors,
-            )
-            
-            if is_valid:
-                validated_sources.append(
-                    Source(
-                        url=validated_url,
-                        title=validated_title,
-                        index=source["index"],
-                    )
-                )
-            else:
-                invalid_count += 1
-                # If URL is invalid, try to find a replacement using validator agent
-                # But only do this for a few invalid URLs to avoid performance issues
-                if invalid_count <= 3:  # Only replace first 3 invalid URLs
-                    try:
-                        replacement = self.validator_agent.validate_urls(
-                            query=f"{input_data.primary_keyword} {source['title']}",
-                            company_url=input_data.company_url,
-                            competitors=input_data.company_competitors,
-                            language=input_data.company_language,
-                            max_results=1,
-                        )
-                        if replacement:
-                            validated_sources.append(
-                                Source(
-                                    url=replacement[0]["url"],
-                                    title=replacement[0]["url_meta_title"],
-                                    index=source["index"],
-                                )
-                            )
-                    except Exception:
-                        pass  # Skip if replacement fails
+        # Validate URLs concurrently for better performance
+        validated_sources = self._validate_sources_concurrent(
+            parsed_sources[:20],  # Limit to 20 sources
+            input_data
+        )
         
         return validated_sources
 
@@ -424,7 +390,6 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
         """
         try:
             from urllib.parse import urlparse
-            import requests
             
             # Parse and normalize URL
             parsed = urlparse(url)
@@ -453,9 +418,7 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
             
             # Check HTTP status (HEAD request, fallback to GET)
             try:
-                response = requests.head(url, allow_redirects=True, timeout=8, headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-                })
+                response = self._http_session.head(url, allow_redirects=True, timeout=8)
                 
                 # Check for 404 or error pages
                 final_url = response.url
@@ -468,9 +431,7 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
                         return False, url, original_title
                     
                     # Do GET request to check content and get title
-                    get_response = requests.get(final_url, timeout=8, headers={
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-                    })
+                    get_response = self._http_session.get(final_url, timeout=8)
                     if get_response.status_code == 200:
                         if self._is_error_page(final_url, get_response):
                             return False, url, original_title
@@ -479,9 +440,7 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
                 elif response.status_code in (301, 302, 303, 307, 308):
                     # Follow redirect
                     final_url = response.url
-                    get_response = requests.get(final_url, timeout=8, headers={
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-                    })
+                    get_response = self._http_session.get(final_url, timeout=8)
                     if get_response.status_code == 200:
                         if self._is_error_page(final_url, get_response):
                             return False, url, original_title
@@ -494,9 +453,7 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
             
             # If HEAD fails, try GET
             try:
-                response = requests.get(url, allow_redirects=True, timeout=8, headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-                })
+                response = self._http_session.get(url, allow_redirects=True, timeout=8)
                 if response.status_code == 200:
                     final_url = response.url
                     # Check for error pages
@@ -573,13 +530,120 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
             pass
         return None
 
+    def _validate_sources_concurrent(
+        self,
+        parsed_sources: List[Dict],
+        input_data: InputSchema
+    ) -> List[Source]:
+        """
+        Validate sources concurrently using thread pool.
+        
+        Args:
+            parsed_sources: List of source dicts with 'url', 'title', 'index'
+            input_data: Input schema with company info
+            
+        Returns:
+            List of validated Source objects
+        """
+        validated_sources = []
+        invalid_sources = []
+        
+        # Validate all URLs concurrently
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            # Submit all validation tasks
+            future_to_source = {
+                executor.submit(
+                    self._validate_source_url,
+                    url=source["url"],
+                    original_title=source["title"],
+                    company_url=input_data.company_url,
+                    competitors=input_data.company_competitors,
+                ): source
+                for source in parsed_sources
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_source):
+                source = future_to_source[future]
+                try:
+                    is_valid, validated_url, validated_title = future.result()
+                    if is_valid:
+                        validated_sources.append(
+                            Source(
+                                url=validated_url,
+                                title=validated_title,
+                                index=source["index"],
+                            )
+                        )
+                    else:
+                        invalid_sources.append(source)
+                except Exception:
+                    invalid_sources.append(source)
+        
+        # Try to replace invalid URLs (limit to first 3 to avoid performance issues)
+        if invalid_sources:
+            replacement_sources = self._find_replacements_concurrent(
+                invalid_sources[:3],
+                input_data
+            )
+            validated_sources.extend(replacement_sources)
+        
+        # Sort by index to maintain order
+        validated_sources.sort(key=lambda s: s.index)
+        return validated_sources
+    
+    def _find_replacements_concurrent(
+        self,
+        invalid_sources: List[Dict],
+        input_data: InputSchema
+    ) -> List[Source]:
+        """
+        Find replacement URLs concurrently for invalid sources.
+        
+        Args:
+            invalid_sources: List of invalid source dicts
+            input_data: Input schema
+            
+        Returns:
+            List of replacement Source objects
+        """
+        replacement_sources = []
+        
+        # Use thread pool to search for replacements concurrently
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_to_source = {
+                executor.submit(
+                    self.validator_agent.validate_urls,
+                    query=f"{input_data.primary_keyword} {source['title']}",
+                    company_url=input_data.company_url,
+                    competitors=input_data.company_competitors,
+                    language=input_data.company_language,
+                    max_results=1,
+                ): source
+                for source in invalid_sources
+            }
+            
+            for future in as_completed(future_to_source):
+                source = future_to_source[future]
+                try:
+                    replacement = future.result()
+                    if replacement:
+                        replacement_sources.append(
+                            Source(
+                                url=replacement[0]["url"],
+                                title=replacement[0]["url_meta_title"],
+                                index=source["index"],
+                            )
+                        )
+                except Exception:
+                    pass  # Skip if replacement fails
+        
+        return replacement_sources
+
     def _fetch_url_title(self, url: str) -> Optional[str]:
         """Fetch page title from URL."""
         try:
-            import requests
-            response = requests.get(url, timeout=8, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            })
+            response = self._http_session.get(url, timeout=8)
             
             # Don't fetch title for error pages
             if self._is_error_page(url, response):

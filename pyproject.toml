@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blog-writer"
+version = "0.1.0"
+description = "AI-powered blog article generation system"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=0.2.0",
+    "pydantic>=2.0.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+blog-writer = "src.main:main"
+

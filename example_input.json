@@ -1,0 +1,17 @@
+{
+  "primary_keyword": "AI adoption in customer service",
+  "company_url": "https://example.com",
+  "company_name": "Example Corp",
+  "company_language": "en",
+  "company_location": "Germany",
+  "company_competitors": ["competitor1.com", "competitor2.io"],
+  "company_info": {
+    "industry": "SaaS",
+    "focus": "Customer experience",
+    "description": "A leading provider of AI-powered customer service solutions"
+  },
+  "content_generation_instruction": "Focus on B2B use cases and European market",
+  "links": ["/product", "/features", "/pricing"],
+  "scope": "EU focus; B2C and B2B; service interactions"
+}
+

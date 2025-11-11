@@ -127,6 +127,12 @@ class QualityChecker:
         if markdown_bold:
             self.errors.append(f"Markdown-style bold found (should use <strong>): {markdown_bold[:3]}")
         
+        # Check for markdown-style emphasis (*text*) - single asterisks
+        # Match *word* patterns but avoid matching within HTML tags
+        markdown_emphasis = re.findall(r'(?<!<)(?<!\*)\*([^*<>]+?)\*(?!\*)(?![^<]*>)', all_html)
+        if markdown_emphasis:
+            self.errors.append(f"Markdown-style emphasis found (should use <em>): {markdown_emphasis[:3]}")
+        
         # Check for broken hrefs
         broken_hrefs = re.findall(r'href="([^"]*?)\s+([^"]*)"', all_html)
         if broken_hrefs:
@@ -333,6 +339,13 @@ class QualityChecker:
                     section.content = re.sub(rf',\s*{cit_num}\]', ']', section.content)
                     section.content = re.sub(rf'\[{cit_num}\s+', '[', section.content)
                     section.content = re.sub(rf'\s+{cit_num}\]', ']', section.content)
+        
+        # Fix markdown emphasis (*text* -> <em>text</em>)
+        # Apply to intro
+        output.intro = re.sub(r'(?<!<)(?<!\*)\*([^*<>]+?)\*(?!\*)(?![^<]*>)', r'<em>\1</em>', output.intro)
+        # Apply to sections
+        for section in output.sections:
+            section.content = re.sub(r'(?<!<)(?<!\*)\*([^*<>]+?)\*(?!\*)(?![^<]*>)', r'<em>\1</em>', section.content)
         
         return output
 

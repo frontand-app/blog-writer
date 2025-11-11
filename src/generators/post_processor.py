@@ -37,6 +37,11 @@ def clean_html_content(text: str) -> str:
     
     # Remove markdown-style bold (**text**)
     text = re.sub(r"\*\*([^*]*)\*\*", r"<strong>\1</strong>", text)
+    
+    # Convert markdown-style emphasis (*text*) to <em> tags
+    # Match *word* patterns but avoid matching within HTML tags or URLs
+    # Use negative lookbehind/lookahead to avoid matching inside tags
+    text = re.sub(r'(?<!<)(?<!\*)\*([^*<>]+?)\*(?!\*)(?![^<]*>)', r'<em>\1</em>', text)
 
     # Fix broken href attributes with whitespace
     text = re.sub(r'href="([^"]*?)\s+([^"]*)"', r'href="\1\2"', text)

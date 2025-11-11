@@ -460,21 +460,32 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
                 # Check for 404 or error pages
                 final_url = response.url
                 if response.status_code == 200:
-                    # Additional check: verify it's not a 404/error page
-                    if self._is_error_page(final_url, response):
+                    # For HEAD requests, we need to check URL path for error indicators
+                    # Full content check will happen in GET request below
+                    url_lower = final_url.lower()
+                    error_url_patterns = ['/notfound', '/not-found', '/404', '/error', 'notfound.aspx', '/notfound.aspx']
+                    if any(pattern in url_lower for pattern in error_url_patterns):
                         return False, url, original_title
-                    title = self._fetch_url_title(final_url) or original_title
-                    return True, final_url, title
+                    
+                    # Do GET request to check content and get title
+                    get_response = requests.get(final_url, timeout=8, headers={
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                    })
+                    if get_response.status_code == 200:
+                        if self._is_error_page(final_url, get_response):
+                            return False, url, original_title
+                        title = self._extract_title_from_response(get_response) or original_title
+                        return True, final_url, title
                 elif response.status_code in (301, 302, 303, 307, 308):
                     # Follow redirect
                     final_url = response.url
-                    response = requests.get(final_url, timeout=8, headers={
+                    get_response = requests.get(final_url, timeout=8, headers={
                         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                     })
-                    if response.status_code == 200:
-                        if self._is_error_page(final_url, response):
+                    if get_response.status_code == 200:
+                        if self._is_error_page(final_url, get_response):
                             return False, url, original_title
-                        title = self._fetch_url_title(final_url) or original_title
+                        title = self._extract_title_from_response(get_response) or original_title
                         return True, final_url, title
                 elif response.status_code == 404:
                     return False, url, original_title
@@ -491,7 +502,7 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
                     # Check for error pages
                     if self._is_error_page(final_url, response):
                         return False, url, original_title
-                    title = self._fetch_url_title(final_url) or original_title
+                    title = self._extract_title_from_response(response) or original_title
                     return True, final_url, title
                 elif response.status_code == 404:
                     return False, url, original_title
@@ -546,12 +557,26 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
         except Exception:
             return False
 
+    def _extract_title_from_response(self, response) -> Optional[str]:
+        """Extract title from response object."""
+        try:
+            from html import unescape
+            if response.status_code == 200 and "text/html" in response.headers.get("Content-Type", ""):
+                match = re.search(r"<title[^>]*>(.*?)</title>", response.text, re.IGNORECASE | re.DOTALL)
+                if match:
+                    title = unescape(match.group(1)).strip()
+                    title = re.sub(r"\s+", " ", title)
+                    if len(title) > 140:
+                        title = title[:137] + "..."
+                    return title
+        except Exception:
+            pass
+        return None
+
     def _fetch_url_title(self, url: str) -> Optional[str]:
         """Fetch page title from URL."""
         try:
             import requests
-            from html import unescape
-            
             response = requests.get(url, timeout=8, headers={
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
             })
@@ -560,16 +585,7 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
             if self._is_error_page(url, response):
                 return None
                 
-            if response.status_code == 200 and "text/html" in response.headers.get("Content-Type", ""):
-                # Extract title from HTML
-                match = re.search(r"<title[^>]*>(.*?)</title>", response.text, re.IGNORECASE | re.DOTALL)
-                if match:
-                    title = unescape(match.group(1)).strip()
-                    title = re.sub(r"\s+", " ", title)
-                    # Truncate if too long
-                    if len(title) > 140:
-                        title = title[:137] + "..."
-                    return title
+            return self._extract_title_from_response(response)
         except Exception:
             pass
         return None

@@ -456,9 +456,13 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
                 response = requests.head(url, allow_redirects=True, timeout=8, headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                 })
+                
+                # Check for 404 or error pages
+                final_url = response.url
                 if response.status_code == 200:
-                    final_url = response.url
-                    # Try to get better title from page
+                    # Additional check: verify it's not a 404/error page
+                    if self._is_error_page(final_url, response):
+                        return False, url, original_title
                     title = self._fetch_url_title(final_url) or original_title
                     return True, final_url, title
                 elif response.status_code in (301, 302, 303, 307, 308):
@@ -468,8 +472,12 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
                         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
                     })
                     if response.status_code == 200:
+                        if self._is_error_page(final_url, response):
+                            return False, url, original_title
                         title = self._fetch_url_title(final_url) or original_title
                         return True, final_url, title
+                elif response.status_code == 404:
+                    return False, url, original_title
             except requests.RequestException:
                 pass
             
@@ -480,8 +488,13 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
                 })
                 if response.status_code == 200:
                     final_url = response.url
+                    # Check for error pages
+                    if self._is_error_page(final_url, response):
+                        return False, url, original_title
                     title = self._fetch_url_title(final_url) or original_title
                     return True, final_url, title
+                elif response.status_code == 404:
+                    return False, url, original_title
             except requests.RequestException:
                 pass
             
@@ -489,6 +502,49 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
             
         except Exception:
             return False, url, original_title
+
+    def _is_error_page(self, url: str, response) -> bool:
+        """Check if URL is an error page (404, etc.)."""
+        try:
+            # Check URL path for error indicators
+            error_indicators = [
+                '/notfound', '/not-found', '/404', '/error', '/page-not-found',
+                'notfound.aspx', '404.aspx', 'error.aspx', 'page-not-found.aspx',
+                '/NotFound', '/NotFound.aspx', 'NotFound.aspx'
+            ]
+            url_lower = url.lower()
+            if any(indicator.lower() in url_lower for indicator in error_indicators):
+                return True
+            
+            # Check response content for error page indicators
+            if hasattr(response, 'text') and response.text:
+                content_lower = response.text.lower()
+                error_phrases = [
+                    'page not found', '404', 'not found', 'error 404',
+                    'die seite wurde nicht gefunden', 'seite nicht gefunden',
+                    'page introuvable', 'página no encontrada', 'nicht gefunden'
+                ]
+                # If multiple error phrases found, it's likely an error page
+                error_count = sum(1 for phrase in error_phrases if phrase in content_lower)
+                if error_count >= 2:
+                    return True
+                
+                # Check title for error indicators
+                title_match = re.search(r'<title[^>]*>(.*?)</title>', response.text, re.IGNORECASE | re.DOTALL)
+                if title_match:
+                    title = title_match.group(1).lower()
+                    error_title_phrases = ['not found', '404', 'error', 'nicht gefunden', 'page not found']
+                    if any(phrase in title for phrase in error_title_phrases):
+                        return True
+            
+            # Check status code
+            if hasattr(response, 'status_code'):
+                if response.status_code in (404, 410, 500, 503):
+                    return True
+            
+            return False
+        except Exception:
+            return False
 
     def _fetch_url_title(self, url: str) -> Optional[str]:
         """Fetch page title from URL."""
@@ -499,6 +555,11 @@ ALWAYS AT ANY TIMES STRICTLY OUTPUT IN THE JSON FORMAT. No extra keys or comment
             response = requests.get(url, timeout=8, headers={
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
             })
+            
+            # Don't fetch title for error pages
+            if self._is_error_page(url, response):
+                return None
+                
             if response.status_code == 200 and "text/html" in response.headers.get("Content-Type", ""):
                 # Extract title from HTML
                 match = re.search(r"<title[^>]*>(.*?)</title>", response.text, re.IGNORECASE | re.DOTALL)
